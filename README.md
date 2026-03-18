@@ -1,44 +1,34 @@
-# BettaFish - 独立 Agent + 飞书消息总线
+# BettaFish - 独立 Agent + 文件消息总线
 
 ## 架构
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     飞书群聊 (消息总线)                       │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │                                                       │  │
-│  │  用户: "分析一下小米SU7"                               │  │
-│  │     ↓                                                 │  │
-│  │  Coordinator: "📋 新任务 @QueryAgent 请分析"           │  │
-│  │     ↓                                                 │  │
-│  │  QueryAgent: "🔍 搜索中..."                           │  │
-│  │     ↓                                                 │  │
-│  │  QueryAgent: "✅ 分析完成: ..."                       │  │
-│  │     ↓                                                 │  │
-│  │  Coordinator: "📊 最终报告"                           │  │
-│  │                                                       │  │
-│  └───────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
-         ↑                                    ↑
-         │                                    │
-   ┌─────┴──────┐                    ┌───────┴──────┐
-   │Coordinator │◄──── 无直接通信 ───►│  QueryAgent  │
-   │(独立Agent) │                    │ (独立Agent)  │
-   └────────────┘                    └──────────────┘
+飞书群聊
+    ↑↓
+OpenClaw 网关 (gateway.py)  ← 在 OpenClaw 会话中运行
+    ↑↓ 通过文件交换
+Agent 进程 (coordinator.py, agent_query.py)  ← 独立运行
 ```
 
-**核心**: Agent 之间不直接通信，都通过飞书群聊消息中转。
+## 文件总线
 
-## 文件说明
+| 目录 | 用途 | 写入者 | 读取者 |
+|------|------|--------|--------|
+| `.feishu_outbox/` | Agent 要发送到飞书的消息 | Agent | 网关 |
+| `.feishu_inbox/` | 飞书消息/Agent 完成通知 | 网关 | Agent |
+| `.agent_inbox/<agent>/` | 分配给 Agent 的任务 | 网关 | Agent |
 
-| 文件 | 角色 | 功能 |
-|------|------|------|
-| `coordinator.py` | Coordinator Agent | 监听群消息 -> 发现任务 -> 分配 -> 汇总报告 |
-| `agent_query.py` | Worker Agent | 监听群消息 -> 发现分配 -> 执行 -> 发结果 |
+## 启动步骤
 
-## 启动方式
+### 1. 启动网关（在 OpenClaw 会话中）
+```python
+# 修改 CHAT_ID 为你的群聊 ID
+CHAT_ID = "oc_xxx"
 
-### 1. 启动 Coordinator
+# 然后执行 gateway.py 的代码
+```
+
+### 2. 启动 Coordinator Agent
 ```python
 sessions_spawn({
     "label": "bf-coordinator",
@@ -48,7 +38,7 @@ sessions_spawn({
 })
 ```
 
-### 2. 启动 Query Agent
+### 3. 启动 Query Agent
 ```python
 sessions_spawn({
     "label": "bf-query",
@@ -58,68 +48,76 @@ sessions_spawn({
 })
 ```
 
-### 3. 在飞书群里使用
+## 使用流程
+
 ```
-用户: @Coordinator 分析一下小米SU7的舆情
+1. 用户在飞书群: "@bf-query 分析一下小米SU7"
 
-Coordinator: 📋 新分析任务
-             Session: sess-xxx
-             查询: 小米SU7舆情
-             @QueryAgent 请进行网络搜索分析
+2. OpenClaw 网关:
+   - 接收飞书消息
+   - 写入 .agent_inbox/bf-query/task_xxx.json
 
-QueryAgent:  🔍 开始处理 Session:sess-xxx
-             【首次总结】找到 5 条信息
-             🤔 反思搜索...
-             ✅ 分析完成
-             分析内容...
+3. Query Agent:
+   - 轮询 .agent_inbox/bf-query/
+   - 发现任务，开始处理
+   - 发送进度消息: 写入 .feishu_outbox/
 
-Coordinator: 📊 舆情分析报告
-             查询: 小米SU7舆情
-             状态: ✅ 完成
-```
+4. OpenClaw 网关:
+   - 轮询 .feishu_outbox/
+   - 读取消息文件
+   - 调用 feishu_im_user_message 发送到群
 
-## 消息协议
-
-### 任务分配
-```
-[Coordinator] @QueryAgent 请分析 "小米SU7"
-              Session: sess-xxx
+5. Query Agent 完成:
+   - 写入 .feishu_inbox/complete_sess_xxx.json
+   - Coordinator 检测到完成，生成报告
 ```
 
-### 进度更新
-```
-[QueryAgent] 🔍 首次搜索...
-[QueryAgent] 【首次总结】找到 N 条信息
-```
+## 消息格式
 
-### 结果提交
-```
-[QueryAgent] ✅ 分析完成 Session:sess-xxx
-              
-              分析内容...
-              
-              @QueryAgent 任务完成
+### Agent 发送消息
+```json
+// .feishu_outbox/<agent>_<timestamp>.json
+{
+  "agent": "bf-query",
+  "text": "分析完成...",
+  "timestamp": "2026-03-18T12:00:00"
+}
 ```
 
-## 扩展
+### 分配给 Agent 的任务
+```json
+// .agent_inbox/bf-query/task_<timestamp>.json
+{
+  "type": "task_assign",
+  "session_id": "sess-xxx",
+  "query": "小米SU7舆情分析",
+  "timestamp": "2026-03-18T12:00:00"
+}
+```
 
-添加 Media Agent:
-1. 创建 `agent_media.py`
-2. 同样的监听模式
-3. Coordinator 分配任务时 @MediaAgent
-4. Media Agent 完成后发结果到群
+### Agent 完成通知
+```json
+// .feishu_inbox/complete_sess_xxx_bf-query.json
+{
+  "type": "agent_complete",
+  "session_id": "sess-xxx",
+  "agent": "bf-query",
+  "result": "分析结果..."
+}
+```
 
-## 优缺点
+## 文件说明
 
-| 优点 | 缺点 |
+| 文件 | 说明 |
 |------|------|
-| Agent 独立运行，可单独重启 | 需要飞书 API 调用 |
-| 可跨网关部署 | 消息有延迟 (~秒级) |
-| 人可直接观察/介入 | 需要轮询群消息 |
-| 结果自动沉淀在群聊历史 | 状态管理稍复杂 |
+| `gateway.py` | OpenClaw 侧网关，桥接飞书 API 和文件总线 |
+| `coordinator.py` | 协调器 Agent，负责创建 session 和汇总 |
+| `agent_query.py` | Query Worker，执行搜索分析 |
 
-## 待实现
+## 待完善
 
-需要用户补充飞书 API 调用:
-- `coordinator.py` 中的 `send_msg()` 和消息获取
-- `agent_query.py` 中的 `send_msg()` 和任务解析
+需要在 `gateway.py` 中实现：
+1. `feishu_im_user_message` 实际调用（发送消息到群）
+2. `feishu_im_user_get_messages` 实际调用（获取群消息）
+
+当前使用文件作为消息队列，Agent 和 OpenClaw 解耦。
